@@ -88,7 +88,6 @@ async function postCommentToDB(artworkIndex, username, bodyText) {
 // --- Toggle like (insert). We'll try to insert; if unique constraint prevents duplicate, ignore error.
 // Optionally support "unlike" by deleting row if exists.
 async function addLikeToDB(artworkIndex) {
-    if (artworkIndex === null || artworkIndex === undefined) return;
     if (!sb) return null;
 
     const payload = { artwork_index: artworkIndex, user_id: GUEST_ID };
@@ -108,18 +107,18 @@ async function addLikeToDB(artworkIndex) {
 }
 
 // Optional: remove like (unlike)
-async function removeLikeFromDB(currentIndex) {
-    if (index === null || index === undefined) return;
+async function removeLikeFromDB(artworkIndex) {
+    if (!sb) return;
     const { data, error } = await sb
-        .from("likes")
+        .from('likes')
         .delete()
-        .match({ artwork_index: index, user_id: GUEST_ID });
+        .match({ artwork_index: artworkIndex, user_id: GUEST_ID });
 
-    console.log("UNLIKE RESULT:", { data, error });
-
-    if (error) console.error("Error removing like:", error);
+    if (error) {
+        console.error('Error deleting like:', error);
+    }
+    return data;
 }
-
 
 // --- Realtime subscriptions: listens for new comments and likes
 function subscribeRealtime(onComment, onLike) {
@@ -139,13 +138,7 @@ function subscribeRealtime(onComment, onLike) {
         })
         .subscribe();
 
-    // Likes DELETE (unlike)
-    sb.channel('likes_channel_del')
-        .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'likes' }, payload => {
-            try { onLike && onLike(payload.old); } catch (e) { console.error(e); }
-        })
-        .subscribe();
-
+    // (Optionally also listen for DELETE on likes if you implement unlike)
 }
 
 /* ===========================
@@ -266,25 +259,20 @@ async function fetchLikeCount(i) {
 
 // Realtime handlers
 function onRemoteComment(newRow) {
-    if (newRow.artwork_index === null || newRow.artwork_index === undefined) return;
-
     const idx = newRow.artwork_index;
-
     sessionComments[idx] = sessionComments[idx] || [];
     sessionComments[idx].push(dbCommentToUI(newRow));
 
     if (currentIndex === idx) renderComments(idx);
 }
 
-
-function onRemoteLike() {
+function onRemoteLike(newRow) {
     if (currentIndex !== null) {
         fetchLikeCount(currentIndex).then(count => {
             modalLikeCount.textContent = `${count} like${count !== 1 ? 's' : ''}`;
         });
     }
 }
-
 
 // Subscribe to realtime
 subscribeRealtime(onRemoteComment, onRemoteLike);
@@ -467,7 +455,6 @@ function openModal(i) {
         addCommentSection.classList.remove('active');
     }
 }
-setTimeout(() => loadCommentsFromDB(currentIndex).then(() => renderComments(currentIndex)), 300);
 
 
 
@@ -703,19 +690,24 @@ likeBtn.addEventListener("click", async () => {
 
     const isLiked = sessionLikes.has(currentIndex);
 
-    if (isLiked) {
-        // UNLIKE
-        await removeLikeFromDB(currentIndex);
-        sessionLikes.delete(currentIndex);
-    } else {
-        // LIKE
-        await addLikeToDB(currentIndex);
-        sessionLikes.add(currentIndex);
+    try {
+        if (isLiked) {
+            // UNLIKE
+            await removeLikeFromDB(currentIndex);
+            sessionLikes.delete(currentIndex);
+        } else {
+            // LIKE
+            await addLikeToDB(currentIndex);
+            sessionLikes.add(currentIndex);
+        }
+
+        // After DB confirms changes → update UI with correct data
+        await updateLikeUI();
+
+    } catch (err) {
+        console.error("Like toggle failed:", err);
     }
-
-    await updateLikeUI(); // refresh UI and count
 });
-
 
 
 
@@ -921,31 +913,35 @@ postComment.addEventListener('click', async () => {
     const txt = commentInput.value.trim();
     if (!txt || currentIndex === null) return;
 
+    // Temporarily use a username prompt or read from a small input field:
     let username = localStorage.getItem('guest_display_name_v1') || null;
     if (!username) {
+        // optionally prompt once
         username = prompt("Enter a display name (optional):") || null;
         if (username) localStorage.setItem('guest_display_name_v1', username);
     }
 
+    // Optimistic UI: update local session immediately
+    sessionComments[currentIndex] = sessionComments[currentIndex] || [];
     const obj = { text: txt, ts: Date.now(), name: username || 'Anonymous' };
-
-    // Optimistic UI
     sessionComments[currentIndex].push(obj);
+    sessionCommented.add(currentIndex);
+    updateCommentUI();
     renderComments(currentIndex);
-    commentInput.value = "";
+    commentInput.value = '';
+    commentsArea.scrollTop = commentsArea.scrollHeight;
 
+    // Persist to Supabase
     try {
-        await postCommentToDB(currentIndex, username, txt);
+        if (sb) {
+            await postCommentToDB(currentIndex, username, txt);
+            // success — DB will broadcast via realtime and other clients will update.
+        }
     } catch (err) {
-        console.error("Failed to send comment:", err);
+        console.error('Failed to save comment to DB', err);
+        // optionally show a toast: "Save failed, will retry"
     }
-
-    // Auto-refresh (optional but recommended)
-    setTimeout(() => {
-        loadCommentsFromDB(currentIndex).then(() => renderComments(currentIndex));
-    }, 300);
 });
-
 
 
 commentInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); postComment.click(); } });
@@ -975,26 +971,6 @@ const obs = new IntersectionObserver((entries) => {
 });
 
 obs.observe(hero);
-sb.channel('likes_channel')
-    .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'likes' }, payload => {
-        try {
-            // handle unlike event here
-            onLike && onLike(payload.old);
-        } catch (e) {
-            console.error(e);
-        }
-    })
-    .subscribe();
-const { data, error } = await sb
-    .from('likes')
-    .delete()
-    .match({ artwork_index: artworkIndex, user_id: GUEST_ID });
-
-if (error) {
-    console.error('Error deleting like:', error.message);
-} else if (!data || data.length === 0) {
-    console.warn('No like found to delete');
-}
 
 // Hero -> guided scroll to next (wheel/touch are attached to main)
 let locking = false;
